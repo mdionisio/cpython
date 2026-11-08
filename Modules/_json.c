@@ -126,14 +126,22 @@ encoder_encode_float(PyEncoderObject *s, PyObject *obj);
 #define IS_WHITESPACE(c) (((c) == ' ') || ((c) == '\t') || ((c) == '\n') || ((c) == '\r'))
 
 #ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
-/* Return a mask of the bytes of v which are '"', '\\' or, if ctrl is true,
-   a control character (U+0000-U+001F). */
+/* Return a mask of the bytes of v which are '"', '\\', a control character
+   (U+0000-U+001F) if ctrl or ascii is true, or U+007F-U+00FF if ascii is
+   true. */
 static inline _Py_v16u8
-special_mask_ucs1(_Py_v16u8 v, int ctrl)
+special_mask_ucs1(_Py_v16u8 v, int ctrl, int ascii)
 {
     _Py_v16u8 m = (_Py_v16u8)(v == _Py_v16u8_splat('"'))
                   | (_Py_v16u8)(v == _Py_v16u8_splat('\\'));
-    if (ctrl) {
+    if (ascii) {
+        // v < 0x20 or v > 0x7e: (v - 0x20) > 0x5e as unsigned, using a
+        // signed comparison which is cheaper on SSE2
+        _Py_v16i8 x = (_Py_v16i8)((v - _Py_v16u8_splat(0x20))
+                                  ^ _Py_v16u8_splat(0x80));
+        m |= (_Py_v16u8)(x > (_Py_v16i8)_Py_v16u8_splat(0x5e ^ 0x80));
+    }
+    else if (ctrl) {
         // v < 0x20, using a signed comparison which is cheaper on SSE2
         _Py_v16i8 x = (_Py_v16i8)(v ^ _Py_v16u8_splat(0x80));
         m |= (_Py_v16u8)(x < (_Py_v16i8)_Py_v16u8_splat(0x20 ^ 0x80));
@@ -148,12 +156,55 @@ static inline Py_ssize_t
 skip_plain_ucs1(const Py_UCS1 *s, Py_ssize_t i, Py_ssize_t n, int ctrl)
 {
     while (n - i >= 16) {
-        if (_Py_v16u8_any(special_mask_ucs1(_Py_v16u8_load(s + i), ctrl))) {
+        if (_Py_v16u8_any(special_mask_ucs1(_Py_v16u8_load(s + i), ctrl, 0))) {
             break;
         }
         i += 16;
     }
     return i;
+}
+
+/* The encoders handle 1-byte kind strings in blocks of 16 characters.
+   plain_run_ucs1() returns the number of characters of s[i:n] (n - i >= 16)
+   before the first one which needs escaping, checking 16 characters at a
+   time.  It stops when less than 16 characters are left: they are not
+   checked.  If out is not NULL, these characters are copied to out, which
+   must have room for n - i + 1 characters: whole blocks are stored, so up
+   to 15 bytes after the run are overwritten. */
+static inline Py_ssize_t
+plain_run_ucs1(const Py_UCS1 *s, Py_ssize_t i, Py_ssize_t n, Py_UCS1 *out,
+               int ascii)
+{
+    _Py_v16u8 v = _Py_v16u8_load(s + i);
+    int k = _Py_v16u8_first_nonzero(special_mask_ucs1(v, 1, ascii));
+    if (out != NULL) {
+        memcpy(out, &v, sizeof(v));
+    }
+    if (k < 16 || n - i - 16 < 16) {
+        return k;
+    }
+    Py_ssize_t j = i + 16;
+    for (;;) {
+        v = _Py_v16u8_load(s + j);
+        k = _Py_v16u8_first_nonzero(special_mask_ucs1(v, 1, ascii));
+        if (out != NULL) {
+            memcpy(out + (j - i), &v, sizeof(v));
+        }
+        j += k;
+        if (k < 16 || n - j < 16) {
+            return j - i;
+        }
+    }
+}
+
+/* After a plain run of length run which ends at i, return where the scalar
+   loop must stop: after the character which needs escaping, or after 64
+   characters if the run was shorter than 4 characters, since the scalar
+   loop is faster when many characters need escaping. */
+static inline Py_ssize_t
+scalar_stop_ucs1(Py_ssize_t i, Py_ssize_t run, Py_ssize_t n)
+{
+    return Py_MIN(i + (run < 4 ? 64 : 1), n);
 }
 #endif
 
@@ -200,26 +251,41 @@ ascii_escape_size(const void *input, int kind, Py_ssize_t input_chars)
     Py_ssize_t output_size;
 
     /* Compute the output size */
-    for (i = 0, output_size = 2; i < input_chars; i++) {
-        Py_UCS4 c = PyUnicode_READ(kind, input, i);
-        Py_ssize_t d;
-        if (S_CHAR(c)) {
-            d = 1;
-        }
-        else {
-            switch(c) {
-            case '\\': case '"': case '\b': case '\f':
-            case '\n': case '\r': case '\t':
-                d = 2; break;
-            default:
-                d = c >= 0x10000 ? 12 : 6;
+    for (i = 0, output_size = 2; i < input_chars; ) {
+        Py_ssize_t stop = input_chars;
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+        if (kind == PyUnicode_1BYTE_KIND && input_chars - i >= 16) {
+            Py_ssize_t run = plain_run_ucs1(input, i, input_chars, NULL, 1);
+            if (output_size > PY_SSIZE_T_MAX - run) {
+                PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
+                return -1;
             }
+            output_size += run;
+            i += run;
+            stop = scalar_stop_ucs1(i, run, input_chars);
         }
-        if (output_size > PY_SSIZE_T_MAX - d) {
-            PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
-            return -1;
+#endif
+        for (; i < stop; i++) {
+            Py_UCS4 c = PyUnicode_READ(kind, input, i);
+            Py_ssize_t d;
+            if (S_CHAR(c)) {
+                d = 1;
+            }
+            else {
+                switch(c) {
+                case '\\': case '"': case '\b': case '\f':
+                case '\n': case '\r': case '\t':
+                    d = 2; break;
+                default:
+                    d = c >= 0x10000 ? 12 : 6;
+                }
+            }
+            if (output_size > PY_SSIZE_T_MAX - d) {
+                PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
+                return -1;
+            }
+            output_size += d;
         }
-        output_size += d;
     }
 
     return output_size;
@@ -240,13 +306,25 @@ ascii_escape_unicode_and_size(const void *input, int kind, Py_ssize_t input_char
     output = PyUnicode_1BYTE_DATA(rval);
     chars = 0;
     output[chars++] = '"';
-    for (i = 0; i < input_chars; i++) {
-        Py_UCS4 c = PyUnicode_READ(kind, input, i);
-        if (S_CHAR(c)) {
-            output[chars++] = c;
+    for (i = 0; i < input_chars; ) {
+        Py_ssize_t stop = input_chars;
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+        if (kind == PyUnicode_1BYTE_KIND && input_chars - i >= 16) {
+            Py_ssize_t run = plain_run_ucs1(input, i, input_chars,
+                                            output + chars, 1);
+            chars += run;
+            i += run;
+            stop = scalar_stop_ucs1(i, run, input_chars);
         }
-        else {
-            chars = ascii_escape_unichar(c, output, chars);
+#endif
+        for (; i < stop; i++) {
+            Py_UCS4 c = PyUnicode_READ(kind, input, i);
+            if (S_CHAR(c)) {
+                output[chars++] = c;
+            }
+            else {
+                chars = ascii_escape_unichar(c, output, chars);
+            }
         }
     }
     output[chars++] = '"';
@@ -317,25 +395,40 @@ escape_size(const void *input, int kind, Py_ssize_t input_chars)
     Py_ssize_t output_size;
 
     /* Compute the output size */
-    for (i = 0, output_size = 2; i < input_chars; i++) {
-        Py_UCS4 c = PyUnicode_READ(kind, input, i);
-        Py_ssize_t d;
-        switch (c) {
-        case '\\': case '"': case '\b': case '\f':
-        case '\n': case '\r': case '\t':
-            d = 2;
-            break;
-        default:
-            if (c <= 0x1f)
-                d = 6;
-            else
-                d = 1;
+    for (i = 0, output_size = 2; i < input_chars; ) {
+        Py_ssize_t stop = input_chars;
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+        if (kind == PyUnicode_1BYTE_KIND && input_chars - i >= 16) {
+            Py_ssize_t run = plain_run_ucs1(input, i, input_chars, NULL, 0);
+            if (output_size > PY_SSIZE_T_MAX - run) {
+                PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
+                return -1;
+            }
+            output_size += run;
+            i += run;
+            stop = scalar_stop_ucs1(i, run, input_chars);
         }
-        if (output_size > PY_SSIZE_T_MAX - d) {
-            PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
-            return -1;
+#endif
+        for (; i < stop; i++) {
+            Py_UCS4 c = PyUnicode_READ(kind, input, i);
+            Py_ssize_t d;
+            switch (c) {
+            case '\\': case '"': case '\b': case '\f':
+            case '\n': case '\r': case '\t':
+                d = 2;
+                break;
+            default:
+                if (c <= 0x1f)
+                    d = 6;
+                else
+                    d = 1;
+            }
+            if (output_size > PY_SSIZE_T_MAX - d) {
+                PyErr_SetString(PyExc_OverflowError, "string is too long to escape");
+                return -1;
+            }
+            output_size += d;
         }
-        output_size += d;
     }
 
     return output_size;
@@ -354,29 +447,46 @@ escape_unicode_and_size(const void *input, int kind, Py_UCS4 maxchar, Py_ssize_t
 
     kind = PyUnicode_KIND(rval);
 
-#define ENCODE_OUTPUT do { \
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+#  define COPY_PLAIN_UCS1 \
+            if (input_chars - i >= 16) { \
+                Py_ssize_t run = plain_run_ucs1(input, i, input_chars, \
+                                                output + chars, 0); \
+                chars += run; \
+                i += run; \
+                stop = scalar_stop_ucs1(i, run, input_chars); \
+            }
+#else
+#  define COPY_PLAIN_UCS1
+#endif
+
+#define ENCODE_OUTPUT(COPY_PLAIN) do { \
         chars = 0; \
         output[chars++] = '"'; \
-        for (i = 0; i < input_chars; i++) { \
-            Py_UCS4 c = PyUnicode_READ(kind, input, i); \
-            switch (c) { \
-            case '\\': output[chars++] = '\\'; output[chars++] = c; break; \
-            case '"':  output[chars++] = '\\'; output[chars++] = c; break; \
-            case '\b': output[chars++] = '\\'; output[chars++] = 'b'; break; \
-            case '\f': output[chars++] = '\\'; output[chars++] = 'f'; break; \
-            case '\n': output[chars++] = '\\'; output[chars++] = 'n'; break; \
-            case '\r': output[chars++] = '\\'; output[chars++] = 'r'; break; \
-            case '\t': output[chars++] = '\\'; output[chars++] = 't'; break; \
-            default: \
-                if (c <= 0x1f) { \
-                    output[chars++] = '\\'; \
-                    output[chars++] = 'u'; \
-                    output[chars++] = '0'; \
-                    output[chars++] = '0'; \
-                    output[chars++] = Py_hexdigits[(c >> 4) & 0xf]; \
-                    output[chars++] = Py_hexdigits[(c     ) & 0xf]; \
-                } else { \
-                    output[chars++] = c; \
+        for (i = 0; i < input_chars; ) { \
+            Py_ssize_t stop = input_chars; \
+            COPY_PLAIN \
+            for (; i < stop; i++) { \
+                Py_UCS4 c = PyUnicode_READ(kind, input, i); \
+                switch (c) { \
+                case '\\': output[chars++] = '\\'; output[chars++] = c; break; \
+                case '"':  output[chars++] = '\\'; output[chars++] = c; break; \
+                case '\b': output[chars++] = '\\'; output[chars++] = 'b'; break; \
+                case '\f': output[chars++] = '\\'; output[chars++] = 'f'; break; \
+                case '\n': output[chars++] = '\\'; output[chars++] = 'n'; break; \
+                case '\r': output[chars++] = '\\'; output[chars++] = 'r'; break; \
+                case '\t': output[chars++] = '\\'; output[chars++] = 't'; break; \
+                default: \
+                    if (c <= 0x1f) { \
+                        output[chars++] = '\\'; \
+                        output[chars++] = 'u'; \
+                        output[chars++] = '0'; \
+                        output[chars++] = '0'; \
+                        output[chars++] = Py_hexdigits[(c >> 4) & 0xf]; \
+                        output[chars++] = Py_hexdigits[(c     ) & 0xf]; \
+                    } else { \
+                        output[chars++] = c; \
+                    } \
                 } \
             } \
         } \
@@ -385,16 +495,17 @@ escape_unicode_and_size(const void *input, int kind, Py_UCS4 maxchar, Py_ssize_t
 
     if (kind == PyUnicode_1BYTE_KIND) {
         Py_UCS1 *output = PyUnicode_1BYTE_DATA(rval);
-        ENCODE_OUTPUT;
+        ENCODE_OUTPUT(COPY_PLAIN_UCS1);
     } else if (kind == PyUnicode_2BYTE_KIND) {
         Py_UCS2 *output = PyUnicode_2BYTE_DATA(rval);
-        ENCODE_OUTPUT;
+        ENCODE_OUTPUT();
     } else {
         Py_UCS4 *output = PyUnicode_4BYTE_DATA(rval);
         assert(kind == PyUnicode_4BYTE_KIND);
-        ENCODE_OUTPUT;
+        ENCODE_OUTPUT();
     }
 #undef ENCODE_OUTPUT
+#undef COPY_PLAIN_UCS1
 
 #ifdef Py_DEBUG
     assert(_PyUnicode_CheckConsistency(rval, 1));

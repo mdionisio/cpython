@@ -59,6 +59,31 @@ _Py_v16u8_any(_Py_v16u8 v)
     return (x[0] | x[1]) != 0;
 }
 
+// Return the index of the first non-zero byte of v, or 16 if all bytes are
+// zero.  Use it on the result of vector comparisons to find the first lane
+// which matched.
+static inline int
+_Py_v16u8_first_nonzero(_Py_v16u8 v)
+{
+    _Py_v2u64 x = (_Py_v2u64)v;
+#if PY_LITTLE_ENDIAN
+    if (x[0]) {
+        return __builtin_ctzll(x[0]) / 8;
+    }
+    if (x[1]) {
+        return 8 + __builtin_ctzll(x[1]) / 8;
+    }
+#else
+    if (x[0]) {
+        return __builtin_clzll(x[0]) / 8;
+    }
+    if (x[1]) {
+        return 8 + __builtin_clzll(x[1]) / 8;
+    }
+#endif
+    return 16;
+}
+
 // Skip ASCII-only blocks of 64 bytes, then 16 bytes.  Return a pointer to
 // the first 16-byte block which contains a non-ASCII byte, or to the last
 // 0..15 bytes which have not been checked.
