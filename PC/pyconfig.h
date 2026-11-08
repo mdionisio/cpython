@@ -188,6 +188,11 @@ WIN32 is still required for the locale module.
 #endif
 #endif /* MS_WIN64 */
 
+/* clang-cl supports GCC/Clang vector extensions (MSVC does not). */
+#if defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+#define _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS 1
+#endif
+
 /* set the version macros for the windows headers */
 /* Python 3.13+ requires Windows 10 or greater */
 #define Py_WINVER 0x0A00 /* _WIN32_WINNT_WIN10 */

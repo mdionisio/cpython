@@ -2145,6 +2145,10 @@
    AND the target architecture has native SIMD (not just API availability) */
 #undef _Py_HAVE_EFFICIENT_BUILTIN_SHUFFLEVECTOR
 
+/* Define if the compiler supports GCC/Clang vector extensions with 128-bit
+   vectors AND the target architecture has native SIMD */
+#undef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+
 /* Defined if _Float16 C type is supported */
 #undef _Py_HAVE_FLOAT16
 

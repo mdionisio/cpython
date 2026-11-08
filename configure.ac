@@ -5461,6 +5461,37 @@ AS_VAR_IF([ac_cv_efficient_builtin_shufflevector], [yes], [
                availability)])
 ])
 
+# Check for GCC/Clang vector extensions (__attribute__((vector_size(16))))
+# on an architecture where they compile to worthwhile native SIMD
+# instructions.  Used by the SIMD helpers in
+# Include/internal/pycore_simd.h.
+AC_CACHE_CHECK([for efficient 128-bit vector extensions],
+               [ac_cv_efficient_vector_extensions], [
+AC_LINK_IFELSE([
+  AC_LANG_PROGRAM([[
+    /* See the __builtin_shufflevector check above for the rationale of
+       the architecture list. */
+    #if !defined(__x86_64__) && !defined(__aarch64__) && \
+        !(defined(__arm__) && defined(__ARM_NEON))
+    #  error "128-bit vector SIMD not worthwhile on this architecture"
+    #endif
+    typedef unsigned char v16u8 __attribute__((vector_size(16)));
+    typedef unsigned long long v2u64 __attribute__((vector_size(16)));
+  ]], [[
+    v16u8 a = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+    v16u8 b = {16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
+    v2u64 c = (v2u64)(a | b);
+    return (int)((c[0] | c[1]) & 1);
+  ]])
+],[ac_cv_efficient_vector_extensions=yes],[ac_cv_efficient_vector_extensions=no])
+])
+
+AS_VAR_IF([ac_cv_efficient_vector_extensions], [yes], [
+    AC_DEFINE([_Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS], [1],
+              [Define if the compiler supports GCC/Clang vector extensions with
+               128-bit vectors AND the target architecture has native SIMD])
+])
+
 # --with-mimalloc
 AC_MSG_CHECKING([for --with-mimalloc])
 AC_ARG_WITH([mimalloc],

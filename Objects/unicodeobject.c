@@ -55,6 +55,7 @@ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #include "pycore_pyhash.h"        // _Py_HashSecret_t
 #include "pycore_pylifecycle.h"   // _Py_SetFileSystemEncoding()
 #include "pycore_pystate.h"       // _PyInterpreterState_GET()
+#include "pycore_simd.h"          // _Py_simd_skip_ascii()
 #include "pycore_ucnhash.h"       // _PyUnicode_Name_CAPI
 #include "pycore_unicodectype.h"  // _PyUnicode_IsXidStart
 #include "pycore_unicodeobject.h" // struct _Py_unicode_state
@@ -5043,14 +5044,19 @@ find_first_nonascii(const unsigned char *start, const unsigned char *end)
 
     const unsigned char *p = start;
 
-    if (end - start >= SIZEOF_SIZE_T) {
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+    // The size_t code below finds the exact position in the remaining bytes.
+    p = _Py_simd_skip_ascii(p, end);
+#endif
+
+    if (end - p >= SIZEOF_SIZE_T) {
         // Avoid unaligned read.
 #if PY_LITTLE_ENDIAN && HAVE_CTZ
         size_t u;
         memcpy(&u, p, sizeof(size_t));
         u &= ASCII_CHAR_MASK;
         if (u) {
-            return (ctz(u) - 7) / 8;
+            return p - start + (ctz(u) - 7) / 8;
         }
         p = _Py_ALIGN_DOWN(p + SIZEOF_SIZE_T, SIZEOF_SIZE_T);
 #else /* PY_LITTLE_ENDIAN && HAVE_CTZ */
@@ -5151,7 +5157,7 @@ utf8_count_codepoints(const unsigned char *s, const unsigned char *end)
 static Py_ssize_t
 ascii_decode(const char *start, const char *end, Py_UCS1 *dest)
 {
-#if SIZEOF_SIZE_T <= SIZEOF_VOID_P
+#if SIZEOF_SIZE_T <= SIZEOF_VOID_P && !defined(_Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS)
     if (_Py_IS_ALIGNED(start, ALIGNOF_SIZE_T)
         && _Py_IS_ALIGNED(dest, ALIGNOF_SIZE_T))
     {
