@@ -5,6 +5,8 @@
 # error "find_max_char.h is specific to Unicode"
 #endif
 
+#include "pycore_simd.h"          // _Py_simd_skip_ascii()
+
 /* Mask to quickly check whether a C 'size_t' contains a
    non-ASCII, UTF8-encoded char. */
 #if (SIZEOF_SIZE_T == 8)
@@ -23,6 +25,9 @@ STRINGLIB(find_max_char)(const STRINGLIB_CHAR *begin, const STRINGLIB_CHAR *end)
     const unsigned char *p = (const unsigned char *) begin;
     const unsigned char *_end = (const unsigned char *)end;
 
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+    p = _Py_simd_skip_ascii(p, _end);
+#endif
     while (p < _end) {
         if (_Py_IS_ALIGNED(p, ALIGNOF_SIZE_T)) {
             /* Help register allocation */
