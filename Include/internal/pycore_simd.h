@@ -23,6 +23,8 @@ extern "C" {
 
 typedef unsigned char _Py_v16u8 __attribute__((vector_size(16)));
 typedef uint64_t _Py_v2u64 __attribute__((vector_size(16)));
+// Signed bytes, for comparisons: SSE2 has no unsigned byte comparison.
+typedef signed char _Py_v16i8 __attribute__((vector_size(16)));
 
 // Load 16 bytes from a possibly unaligned address.
 static inline _Py_v16u8
@@ -46,6 +48,15 @@ _Py_v16u8_has_nonascii(_Py_v16u8 v)
 {
     _Py_v2u64 x = (_Py_v2u64)v;
     return ((x[0] | x[1]) & 0x8080808080808080ULL) != 0;
+}
+
+// Return non-zero if any byte of v is non-zero.  Use it on the result of
+// vector comparisons (lanes are 0 or 0xFF) to test if any lane matched.
+static inline int
+_Py_v16u8_any(_Py_v16u8 v)
+{
+    _Py_v2u64 x = (_Py_v2u64)v;
+    return (x[0] | x[1]) != 0;
 }
 
 // Skip ASCII-only blocks of 64 bytes, then 16 bytes.  Return a pointer to

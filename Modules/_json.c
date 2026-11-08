@@ -16,6 +16,7 @@
 #include "pycore_global_strings.h" // _Py_ID()
 #include "pycore_pyerrors.h"      // _PyErr_FormatNote
 #include "pycore_runtime.h"       // _PyRuntime
+#include "pycore_simd.h"          // _Py_v16u8_load()
 #include "pycore_tuple.h"         // _PyTuple_FromPair
 #include "pycore_unicodeobject.h" // _PyUnicode_CheckConsistency()
 
@@ -123,6 +124,38 @@ encoder_encode_float(PyEncoderObject *s, PyObject *obj);
 
 #define S_CHAR(c) (c >= ' ' && c <= '~' && c != '\\' && c != '"')
 #define IS_WHITESPACE(c) (((c) == ' ') || ((c) == '\t') || ((c) == '\n') || ((c) == '\r'))
+
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+/* Return a mask of the bytes of v which are '"', '\\' or, if ctrl is true,
+   a control character (U+0000-U+001F). */
+static inline _Py_v16u8
+special_mask_ucs1(_Py_v16u8 v, int ctrl)
+{
+    _Py_v16u8 m = (_Py_v16u8)(v == _Py_v16u8_splat('"'))
+                  | (_Py_v16u8)(v == _Py_v16u8_splat('\\'));
+    if (ctrl) {
+        // v < 0x20, using a signed comparison which is cheaper on SSE2
+        _Py_v16i8 x = (_Py_v16i8)(v ^ _Py_v16u8_splat(0x80));
+        m |= (_Py_v16u8)(x < (_Py_v16i8)_Py_v16u8_splat(0x20 ^ 0x80));
+    }
+    return m;
+}
+
+/* Skip the 16-byte blocks of a 1-byte kind string s[i:n] which contain no
+   special character (see special_mask_ucs1()).  Return the index of the
+   first block which contains one, or of the last 0..15 characters. */
+static inline Py_ssize_t
+skip_plain_ucs1(const Py_UCS1 *s, Py_ssize_t i, Py_ssize_t n, int ctrl)
+{
+    while (n - i >= 16) {
+        if (_Py_v16u8_any(special_mask_ucs1(_Py_v16u8_load(s + i), ctrl))) {
+            break;
+        }
+        i += 16;
+    }
+    return i;
+}
+#endif
 
 static Py_ssize_t
 ascii_escape_unichar(Py_UCS4 c, unsigned char *output, Py_ssize_t chars)
@@ -503,7 +536,13 @@ scanstring_unicode(PyObject *pystr, Py_ssize_t end, int strict, Py_ssize_t *next
         {
             // Use tight scope variable to help register allocation.
             Py_UCS4 d = 0;
-            for (next = end; next < len; next++) {
+            next = end;
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+            if (kind == PyUnicode_1BYTE_KIND) {
+                next = skip_plain_ucs1(buf, next, len, strict);
+            }
+#endif
+            for (; next < len; next++) {
                 d = PyUnicode_READ(kind, buf, next);
                 if (d == '"' || d == '\\') {
                     break;
