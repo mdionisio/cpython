@@ -1,6 +1,7 @@
 #include "Python.h"
 #include "pycore_abstract.h"   // _PyIndex_Check()
 #include "pycore_bytes_methods.h"
+#include "pycore_simd.h"       // _Py_v16u8_load()
 
 PyDoc_STRVAR_shared(_Py_isspace__doc__,
 "B.isspace() -> bool\n\
@@ -247,12 +248,37 @@ PyDoc_STRVAR_shared(_Py_lower__doc__,
 \n\
 Return a copy of B with all ASCII characters converted to lowercase.");
 
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+/* Flip the case (XOR 0x20) of the bytes in the range [first, first + 25],
+   16 bytes at a time.  Return the number of bytes processed. */
+static Py_ssize_t
+bytes_flip_case_simd(char *result, const char *cptr, Py_ssize_t len,
+                     unsigned char first)
+{
+    const _Py_v16u8 vfirst = _Py_v16u8_splat(first);
+    const _Py_v16u8 v26 = _Py_v16u8_splat(26);
+    const _Py_v16u8 v20 = _Py_v16u8_splat(0x20);
+    Py_ssize_t i = 0;
+
+    for (; len - i >= 16; i += 16) {
+        _Py_v16u8 v = _Py_v16u8_load((const unsigned char *)cptr + i);
+        _Py_v16u8 in_range = (_Py_v16u8)((v - vfirst) < v26);
+        v ^= in_range & v20;
+        memcpy(result + i, &v, sizeof(v));
+    }
+    return i;
+}
+#endif
+
 void
 _Py_bytes_lower(char *result, const char *cptr, Py_ssize_t len)
 {
-    Py_ssize_t i;
+    Py_ssize_t i = 0;
 
-    for (i = 0; i < len; i++) {
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+    i = bytes_flip_case_simd(result, cptr, len, 'A');
+#endif
+    for (; i < len; i++) {
         result[i] = Py_TOLOWER((unsigned char) cptr[i]);
     }
 }
@@ -266,9 +292,12 @@ Return a copy of B with all ASCII characters converted to uppercase.");
 void
 _Py_bytes_upper(char *result, const char *cptr, Py_ssize_t len)
 {
-    Py_ssize_t i;
+    Py_ssize_t i = 0;
 
-    for (i = 0; i < len; i++) {
+#ifdef _Py_HAVE_EFFICIENT_VECTOR_EXTENSIONS
+    i = bytes_flip_case_simd(result, cptr, len, 'a');
+#endif
+    for (; i < len; i++) {
         result[i] = Py_TOUPPER((unsigned char) cptr[i]);
     }
 }

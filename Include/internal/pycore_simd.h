@@ -33,6 +33,13 @@ _Py_v16u8_load(const unsigned char *p)
     return v;
 }
 
+// Return a vector with all 16 bytes set to x.
+static inline _Py_v16u8
+_Py_v16u8_splat(unsigned char x)
+{
+    return (_Py_v16u8){x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x};
+}
+
 // Return non-zero if any byte of v is non-ASCII (has its high bit set).
 static inline int
 _Py_v16u8_has_nonascii(_Py_v16u8 v)
