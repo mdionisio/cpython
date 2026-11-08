@@ -1383,6 +1383,147 @@ bigcomp(U *rv, const char *s0, BCinfo *bc)
     return 0;
 }
 
+/* Eisel-Lemire fast path for _Py_dg_strtod.
+
+   Given a nonzero 64-bit integer w and a decimal exponent q, the Eisel-Lemire
+   algorithm usually determines the correctly rounded (round-half-even) double
+   nearest to w * 10**q using one or two 64x64->128-bit multiplications by a
+   precomputed 128-bit approximation of 5**q.  When it can't decide, or when
+   the result would be subnormal, zero or infinite, it reports failure and
+   _Py_dg_strtod falls back to its usual (bignum-based) algorithm.
+
+   References:
+     Daniel Lemire, "Number Parsing at a Gigabyte per Second",
+     Software: Practice and Experience 51 (8), 2021.
+     https://arxiv.org/abs/2101.11408
+     Noble Mushtak and Daniel Lemire, "Fast Number Parsing Without Fallback",
+     Software: Practice and Experience 53 (6), 2023.
+*/
+
+#include "dtoa_pow5.h"            // dtoa_pow5_128[]
+
+/* Return the high 64 bits of a * b, and store the low 64 bits in *lo. */
+static inline uint64_t
+dtoa_umul128(uint64_t a, uint64_t b, uint64_t *lo)
+{
+#if defined(__SIZEOF_INT128__)
+    __extension__ typedef unsigned __int128 dtoa_uint128;
+    dtoa_uint128 p = (dtoa_uint128)a * b;
+    *lo = (uint64_t)p;
+    return (uint64_t)(p >> 64);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    uint64_t hi;
+    *lo = _umul128(a, b, &hi);
+    return hi;
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    *lo = a * b;
+    return __umulh(a, b);
+#else
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
+    uint64_t p0 = a_lo * b_lo, p1 = a_lo * b_hi;
+    uint64_t p2 = a_hi * b_lo, p3 = a_hi * b_hi;
+    uint64_t mid = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+    *lo = (mid << 32) | (uint32_t)p0;
+    return p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+#endif
+}
+
+/* Number of leading zero bits of x; x must be nonzero. */
+static inline int
+dtoa_clz64(uint64_t x)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_clzll(x);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long msb;
+    _BitScanReverse64(&msb, x);
+    return 63 - (int)msb;
+#else
+    int n = 0;
+    while (!(x & ((uint64_t)1 << 63))) {
+        x <<= 1;
+        n++;
+    }
+    return n;
+#endif
+}
+
+/* Try to compute the double nearest to w * 10**q (w != 0), rounding
+   half-to-even.  On success, store it in *rv and return 1.  Return 0, leaving
+   *rv untouched, if the result can't be determined cheaply or if it is not a
+   finite normal double. */
+static int
+eisel_lemire(uint64_t w, int q, U *rv)
+{
+    const uint64_t *pow5;
+    uint64_t hi, lo, hi2, lo2, mantissa;
+    int lz, upperbit, shift, power2;
+
+    assert(w != 0);
+    if (q < DTOA_POW5_MIN || q > DTOA_POW5_MAX)
+        return 0;
+
+    /* Normalize w, so that its most significant bit is set. */
+    lz = dtoa_clz64(w);
+    w <<= lz;
+
+    /* Compute the high 128 bits of w * 5**q.  We need P + 2 = 55 accurate
+       bits; the truncated first product is accurate enough unless its low
+       64 - 55 = 9 bits are all ones, in which case use the second half of the
+       128-bit approximation of 5**q. */
+    pow5 = &dtoa_pow5_128[2 * (q - DTOA_POW5_MIN)];
+    hi = dtoa_umul128(w, pow5[0], &lo);
+    if ((hi & 0x1FF) == 0x1FF) {
+        hi2 = dtoa_umul128(w, pow5[1], &lo2);
+        lo += hi2;
+        if (lo < hi2)
+            hi++;
+    }
+    /* If the low bits are still all ones, the product may be inaccurate
+       (outside the exponent range where it is known to be exact). */
+    if (lo == UINT64_MAX && (q < -27 || q > 55))
+        return 0;
+
+    /* Extract P + 1 = 54 bits, the last being the rounding bit. */
+    upperbit = (int)(hi >> 63);
+    shift = upperbit + 64 - P - 2;
+    mantissa = hi >> shift;
+    /* Biased binary exponent: floor(q * log2(10)) + 63 + upperbit - lz + Bias.
+       217706 / 2**16 approximates log2(10); it gives the exact floor for all
+       q in [-342, 308]. */
+    power2 = Py_ARITHMETIC_RIGHT_SHIFT(int, 217706 * q, 16) + 63
+             + upperbit - lz + Bias;
+    if (power2 <= 0) {
+        /* Subnormal result, or underflow to zero. */
+        return 0;
+    }
+
+    /* We normally round up a halfway bit, but if we're exactly halfway
+       between two doubles we need to round to even.  Exact halfway cases
+       are only possible for q in [-4, 23]. */
+    if (lo <= 1 && q >= -4 && q <= 23 && (mantissa & 3) == 1
+        && (mantissa << shift) == hi)
+    {
+        mantissa &= ~(uint64_t)1;
+    }
+    mantissa += mantissa & 1;
+    mantissa >>= 1;
+    if (mantissa >= ((uint64_t)2 << (P - 1))) {
+        /* Rounding carried into the next binade. */
+        mantissa = (uint64_t)1 << (P - 1);
+        power2++;
+    }
+    if (power2 >= 2 * Bias + 1) {
+        /* Overflow. */
+        return 0;
+    }
+    mantissa &= ~((uint64_t)1 << (P - 1));
+    word0(rv) = ((ULong)power2 << Exp_shift) | (ULong)(mantissa >> 32);
+    word1(rv) = (ULong)(mantissa & 0xFFFFFFFF);
+    return 1;
+}
+
 
 double
 _Py_dg_strtod(const char *s00, char **se)
@@ -1615,6 +1756,33 @@ _Py_dg_strtod(const char *s00, char **se)
             goto ret;
         }
     }
+
+    /* Try the Eisel-Lemire fast path, using the first min(19, nd)
+       significant digits (19 digits always fit in a uint64_t).  If there are
+       more than 19 digits, the input value lies strictly between w * 10**q
+       and (w + 1) * 10**q; if both bounds round to the same double, that's
+       the answer. */
+    {
+        uint64_t w = 0;
+        int n = nd < 19 ? nd : 19;
+        U el, el1;
+        for (i = 0; i < n; i++)
+            w = 10*w + (uint64_t)(s0[i < nd0 ? i : i+1] - '0');
+        if (nd <= 19) {
+            if (eisel_lemire(w, e, &el)) {
+                dval(&rv) = dval(&el);
+                goto ret;
+            }
+        }
+        else if (eisel_lemire(w, e + (nd - 19), &el)
+                 && eisel_lemire(w + 1, e + (nd - 19), &el1)
+                 && dval(&el) == dval(&el1))
+        {
+            dval(&rv) = dval(&el);
+            goto ret;
+        }
+    }
+
     e1 += nd - k;
 
     bc.scale = 0;

@@ -212,6 +212,31 @@ class StrtodTests(unittest.TestCase):
                 s = '{}e{}'.format(digits, exponent)
                 self.check_strtod(s)
 
+    def test_eisel_lemire_boundaries(self):
+        # Inputs near the limits of the Eisel-Lemire fast path: the
+        # range of its power-of-five table, the switch from 19 to 20
+        # significant digits, and the exponents where its exactness and
+        # round-half-even checks change behaviour.
+        exponents = [-360, -343, -342, -341, -326, -325, -324, -308, -307,
+                     -28, -27, -26, -5, -4, -3, 22, 23, 24, 55, 56,
+                     288, 289, 290, 307, 308, 309]
+        for exponent in exponents:
+            for digits in (1, 9, 10**18, 10**19 - 1, 10**19, 10**19 + 1,
+                           2**53, 2**53 + 1, 2**54 - 1, 2**64 - 1, 2**64):
+                self.check_strtod('{}e{}'.format(digits, exponent))
+            for ndigs in 18, 19, 20, 21:
+                for i in range(TEST_SIZE):
+                    digits = random.randrange(10**(ndigs - 1), 10**ndigs)
+                    self.check_strtod('{}e{}'.format(digits, exponent))
+                    # Inputs whose first 19 digits are all nines, so
+                    # that the upper bound w + 1 used for long inputs
+                    # carries into a 20th digit.
+                    if ndigs > 19:
+                        tail = digits % 10**(ndigs - 19)
+                        s = '{}{:0{}}e{}'.format('9' * 19, tail,
+                                                 ndigs - 19, exponent)
+                        self.check_strtod(s)
+
     def test_parsing(self):
         # make '0' more likely to be chosen than other digits
         digits = '000000123456789'

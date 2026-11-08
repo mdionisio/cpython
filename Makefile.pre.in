@@ -3281,7 +3281,7 @@ regen-jit: $(JIT_TARGETS)
 # with -O2 or higher and strict aliasing miscompiles the ratio() function
 # causing rounding issues. Compile dtoa.c using -fno-strict-aliasing on clang.
 # https://bugs.llvm.org//show_bug.cgi?id=31928
-Python/dtoa.o: Python/dtoa.c
+Python/dtoa.o: Python/dtoa.c Python/dtoa_pow5.h
 	$(CC) -c $(PY_CORE_CFLAGS) $(CFLAGS_ALIASING) -o $@ $<
 
 Python/ceval.o: Python/ceval.c
